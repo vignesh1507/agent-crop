@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageChops
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from agent_banana.memory import ContextFolder  # noqa: E402
+from agent_banana.nano_banana import MockNanoBananaClient  # noqa: E402
+from agent_banana.pipeline import AgentBananaApp  # noqa: E402
+from agent_banana.planning import RLPlanner, RLValueStore  # noqa: E402
+from agent_banana.quality import QualityJudge  # noqa: E402
+from agent_banana.targeting import classify_target, refine_bbox_for_profile  # noqa: E402
+from agent_banana.vision import assess_preview_framing, decode_image_payload, fit_image_inside_canvas, infer_bbox_from_preview  # noqa: E402
+
+
+def make_test_image() -> Image.Image:
+    image = Image.new("RGB", (220, 180), "#f7f2e8")
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((72, 48, 146, 122), fill="#d97706", outline="#8c3b12", width=3)
+    draw.rectangle((20, 132, 200, 164), fill="#d7e1c6")
+    return image
+
+
+class AgentBananaPlannerTests(unittest.TestCase):
+    def test_rl_planner_ranks_local_replacement_before_global_style(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            planner = RLPlanner(RLValueStore(Path(tmp_dir) / "planner.json"))
+            context = ContextFolder().fold([])
+            edits = planner.parse_instruction("Replace the bowl with a banana then warm the background lighting.", context)
+            candidates = planner.plan(edits, context)
+
+        self.assertGreater(len(candidates), 1)
+        selected = candidates[0]
+        self.assertEqual([step.edit_id for step in selected.steps], ["edit-1", "edit-2"])
+        self.assertEqual(selected.steps[0].mode, "preview_expand")
+        self.assertEqual(selected.steps[1].scope, "global")
+
+    def test_glasses_removal_prefers_tight_local_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            planner = RLPlanner(RLValueStore(Path(tmp_dir) / "planner.json"))
+            context = ContextFolder().fold([])
+            edits = planner.parse_instruction("Remove the glasses worn by the lady from the image.", context)
+            candidates = planner.plan(edits, context)
+
+        self.assertEqual(classify_target(edits[0].target, edits[0].verb), "face_accessory")
+        self.assertEqual(candidates[0].steps[0].mode, "preview_tight")
+
+
+class AgentBananaVisionTests(unittest.TestCase):
+    def test_preview_diff_infers_reasonable_bbox(self) -> None:
+        source = Image.new("RGB", (200, 200), "white")
+        preview = source.copy()
+        draw = ImageDraw.Draw(preview)
+        draw.rectangle((40, 50, 100, 120), fill="#d97706")
+
+        bbox = infer_bbox_from_preview(source, preview, threshold=10, padding=0)
+
+        self.assertIsNotNone(bbox)
+        assert bbox is not None
+        self.assertLessEqual(bbox.left, 40)
+        self.assertLessEqual(bbox.top, 50)
+        self.assertGreaterEqual(bbox.right, 100)
+        self.assertGreaterEqual(bbox.bottom, 120)
+
+    def test_face_accessory_bbox_is_shrunk_from_large_preview_region(self) -> None:
+        source = Image.new("RGB", (480, 640), "white")
+        preview = source.copy()
+        draw = ImageDraw.Draw(preview)
+        draw.rectangle((70, 30, 240, 220), fill="#444444")
+
+        raw_bbox = infer_bbox_from_preview(source, preview, threshold=10, padding=0)
+        assert raw_bbox is not None
+        refined = refine_bbox_for_profile(raw_bbox, source.size, "face_accessory")
+
+        self.assertLess(refined.area, raw_bbox.area)
+        self.assertLessEqual(refined.width, int(source.size[0] * 0.28))
+        self.assertLessEqual(refined.height, int(source.size[1] * 0.14))
+
+    def test_preview_framing_assessment_detects_reframed_preview(self) -> None:
+        source = make_test_image().resize((480, 640))
+        cropped = source.crop((60, 0, 420, 640))
+        reframed = fit_image_inside_canvas(cropped, source.size)
+
+        assessment = assess_preview_framing(source, reframed)
+
+        self.assertGreater(assessment["average"], 0.03)
+
+
+class AgentBananaQualityTests(unittest.TestCase):
+    def test_quality_rejects_oversized_face_accessory_edit(self) -> None:
+        before = Image.new("RGB", (240, 240), "white")
+        after = before.copy()
+        draw = ImageDraw.Draw(after)
+        draw.rectangle((40, 40, 180, 170), fill="black")
+        judge = QualityJudge()
+
+        quality = judge.evaluate(
+            before,
+            after,
+            refine_bbox_for_profile(
+                infer_bbox_from_preview(before, after, threshold=10, padding=0),
+                before.size,
+                "face_accessory",
+            ),
+            preview=after,
+            target="glasses",
+            verb="remove",
+        )
+
+        self.assertFalse(quality.accepted)
+        self.assertTrue(any("changed more structure" in note or "too large" in note for note in quality.notes))
+
+
+class AgentBananaPipelineTests(unittest.TestCase):
+    def test_mock_pipeline_runs_end_to_end_and_persists_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            app = AgentBananaApp(root=root, image_client=MockNanoBananaClient())
+            image = make_test_image()
+
+            result = app.run(image, "Replace the center fruit with a banana and warm the background.")
+
+            self.assertEqual(result.mode, "mock-nano-banana")
+            self.assertEqual(len(result.step_results), 2)
+            self.assertTrue(result.session_id)
+            session_path = root / "artifacts" / "agent_banana" / "sessions" / f"{result.session_id}.json"
+            self.assertTrue(session_path.exists())
+
+            final_image = decode_image_payload(result.final_image)
+            diff = ImageChops.difference(image, final_image)
+            self.assertIsNotNone(diff.getbbox())
+            self.assertGreater(result.reward, 0.0)
+
+    def test_local_edit_ignores_reframed_preview_for_localization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            app = AgentBananaApp(root=root, image_client=MockNanoBananaClient())
+            image = make_test_image().resize((480, 640))
+            step = app.planner.plan(
+                app.planner.parse_instruction("Remove the glasses from the woman.", ContextFolder().fold([])),
+                ContextFolder().fold([]),
+            )[0].steps[0]
+            cropped = image.crop((80, 0, 400, 640))
+
+            normalized_preview, use_preview = app._prepare_preview_for_localization(
+                image,
+                cropped,
+                step,
+                "face_accessory",
+            )
+
+            self.assertFalse(use_preview)
+            self.assertEqual(normalized_preview.size, image.size)
+
+
+if __name__ == "__main__":
+    unittest.main()

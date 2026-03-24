@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-banana"
+version = "0.1.0"
+description = "End-to-end image editing agent with RL-style planning and Nano Banana preview localization."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["Pillow>=10.0"]
+
+[project.scripts]
+agent-banana-edit = "agent_banana.cli:main"
+agent-banana-serve = "agent_banana.server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
